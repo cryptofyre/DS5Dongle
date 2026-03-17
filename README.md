@@ -16,6 +16,9 @@
 # 未来计划
 1. 耳机与扬声器支持
 
+# 编译
+需要将pico sdk里面的tinyusb版本升级到最新
+
 # 致谢
  - [rafaelvaloto/Pico_W-Dualsense](https://github.com/rafaelvaloto/Pico_W-Dualsense) - 灵感来源
  - [egormanga/SAxense](https://github.com/egormanga/SAxense) - 震动报文
