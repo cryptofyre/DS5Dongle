@@ -342,11 +342,6 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                 feature_data[report_id].assign(packet + 1, packet + size);
                 printf("[L2CAP] Stored Feature Report 0x%02X, len=%u\n", report_id, size - 1);
             }
-            if (packet[0] == 0x00) {
-                printf("[L2CAP] Getting Test Result\n");
-                feature_data.erase(0x81);
-                get_feature_data(0x81,64);
-            }
             printf("[L2CAP] HID Control data len=%u\n", size);
             printf_hexdump(packet, size);
             bt_data_callback(CONTROL, packet, size);
@@ -486,15 +481,19 @@ void bt_write(uint8_t *data, uint16_t len) {
 }
 
 vector<uint8_t> get_feature_data(uint8_t reportId, uint16_t len) {
-    if (!feature_data.contains(reportId) || feature_data[reportId].empty()) {
+    // 若为0x81则会请求新内容，其他若有旧数据则不进行请求
+    auto ret = vector<uint8_t>{};
+    if (feature_data.contains(reportId)) {
+        ret = feature_data[reportId];
+    }
+    if (!feature_data.contains(reportId) || reportId == 0x81) {
         if (hid_control_cid != 0) {
             uint8_t get_feature[] = {0x43, reportId};
             l2cap_send(hid_control_cid, get_feature, len);
             printf("[L2CAP] Requesting Get Feature Report 0x%02X\n", reportId);
         }
-        return {};
     }
-    return feature_data[reportId];
+    return ret;
 }
 
 void set_feature_data(uint8_t reportId, uint8_t* data,uint16_t len) {
