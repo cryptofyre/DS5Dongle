@@ -44,6 +44,16 @@ void set_headset(bool state) {
     plug_headset = state;
 }
 
+// 有一个重构的想法，就是也把haptics也放进队列里面，使用定时器来发送数据
+// 定时器伪代码:
+// static uint8_t haptics_buf[64];
+// static uint8_t speaker_buf[200];
+// static auto last = time_us32();
+// auto now = time_us32();
+// if(now - last < 10666) return;
+// func: send haptics and speaker;
+// try_queue_remove - haptics and speaker
+// 缺点是可能会导致haptics有延迟，不够实时？
 void audio_loop() {
     // 1. 读取 USB 音频数据
     if (!tud_audio_available()) return;
@@ -131,7 +141,8 @@ void audio_loop() {
 }
 
 void audio_init() {
-    resampler.SetMode(true, 0, false);
+    resampler.SetMode(true, 2, false);
+    resampler.SetFilterParms();
     resampler.SetRates(48000, 3000);
     resampler.SetFeedMode(true);
     // resampler.Prealloc(2, 480, 32);
@@ -153,7 +164,7 @@ void core1_entry() {
     opus_encoder_ctl(encoder,OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
     opus_encoder_ctl(encoder,OPUS_SET_BITRATE(200 * 8 * 100));
     opus_encoder_ctl(encoder,OPUS_SET_VBR(false));
-    opus_encoder_ctl(encoder,OPUS_SET_COMPLEXITY(0));
+    opus_encoder_ctl(encoder,OPUS_SET_COMPLEXITY(0)); // max 4
     resampler_audio.SetMode(true,0,false);
     resampler_audio.SetRates(51200,48000);
     resampler_audio.SetFeedMode(true);
