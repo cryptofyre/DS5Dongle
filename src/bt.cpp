@@ -435,6 +435,9 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             } else {
                 printf("[L2CAP] Channel closed cid=0x%04X\n", local_cid);
             }
+            if (hid_control_cid == 0 && hid_interrupt_cid == 0) {
+                bt_disconnect();
+            }
             break;
         }
 
