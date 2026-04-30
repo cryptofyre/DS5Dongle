@@ -81,11 +81,6 @@ void bt_l2cap_init() {
 }
 
 int bt_init() {
-    if (cyw43_arch_init()) {
-        printf("Failed to initialize CYW43\n");
-        return 1;
-    }
-
     critical_section_init(&queue_lock);
 
     bt_l2cap_init();
