@@ -96,7 +96,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 target_link_libraries(ds5-bridge
         pico_stdlib
         pico_multicore
-        hardware_interp
+        hardware_watchdog
         hardware_timer
         pico_btstack_classic
 #        pico_cyw43_arch_threadsafe_background

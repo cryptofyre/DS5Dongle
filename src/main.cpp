@@ -10,6 +10,7 @@
 #include "audio.h"
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"
+#include "hardware/watchdog.h"
 #include "pico/cyw43_arch.h"
 
 int reportSeqCounter = 0;
@@ -99,24 +100,46 @@ int main() {
     vreg_set_voltage(VREG_VOLTAGE_1_20);
     sleep_ms(1000);
     set_sys_clock_khz(320000, true);
-    board_init();
 
+    board_init();
     tusb_rhport_init_t dev_init = {
         .role = TUSB_ROLE_DEVICE,
-        .speed = TUSB_SPEED_AUTO
+        .speed = TUSB_SPEED_FULL
     };
     tusb_init(BOARD_TUD_RHPORT, &dev_init);
-
     tud_disconnect();
-
     board_init_after_tusb();
+
+    if (cyw43_arch_init()) {
+        printf("Failed to initialize CYW43\n");
+        return 1;
+    }
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
+
+    if (watchdog_caused_reboot()) {
+        printf("Rebooted by Watchdog!\n");
+        // 当崩溃重启以后，闪三下灯
+        for (int i = 0;i < 6;i++) {
+            if (i % 2 == 0) {
+                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, true);
+            }else {
+                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
+            }
+            sleep_ms(500);
+        }
+    } else {
+        printf("Clean boot\n");
+    }
 
     bt_init();
     bt_register_data_callback(on_bt_data);
 
     audio_init();
 
+    watchdog_enable(1000, true);
+
     while (1) {
+        watchdog_update();
         cyw43_arch_poll();
         tud_task();
         audio_loop();
