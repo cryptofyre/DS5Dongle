@@ -7,28 +7,26 @@
 
 #include "bt.h"
 
-#include <queue>
-#include <unordered_map>
-#include <vector>
 
 #include "btstack_event.h"
 #include "l2cap.h"
+#include "gap.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdio.h"
 #include "usb.h"
 #include "utils.h"
+#include "controller_profile.h"
+#include "persist.h"
 #include "bsp/board_api.h"
 #include "pico/sync.h"
 #include "classic/sdp_server.h"
 
 #define MTU 672
 
-using std::unordered_map;
-using std::vector;
-using std::queue;
 
 static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
+static void l2cap_can_send_now_drain(void);
 
 static btstack_packet_callback_registration_t hci_event_callback_registration, l2cap_event_callback_registration;
 static bd_addr_t current_device_addr;
@@ -38,8 +36,67 @@ static hci_con_handle_t acl_handle = HCI_CON_HANDLE_INVALID;
 static uint16_t hid_control_cid;
 static uint16_t hid_interrupt_cid;
 static bt_data_callback_t bt_data_callback = nullptr;
-unordered_map<uint8_t, vector<uint8_t> > feature_data;
-static queue<vector<uint8_t> > send_queue;
+// Cached feature-report payloads, keyed by report ID. Linear scan; cold path.
+// Sized to cover DS (4-5 IDs) + Edge (~20 IDs) with headroom. Each entry stores
+// just the payload — no report ID prefix.
+#define FEATURE_CACHE_SLOTS 24
+#define FEATURE_PAYLOAD_MAX 64
+struct feature_entry {
+    uint8_t  id;       // 0 = unused
+    uint8_t  len;      // bytes valid in payload
+    uint8_t  payload[FEATURE_PAYLOAD_MAX];
+};
+static feature_entry feature_table[FEATURE_CACHE_SLOTS];
+static uint8_t feature_next_evict = 0;
+
+static feature_entry* feature_find(uint8_t id) {
+    for (uint8_t i = 0; i < FEATURE_CACHE_SLOTS; i++) {
+        if (feature_table[i].id == id) return &feature_table[i];
+    }
+    return nullptr;
+}
+
+static feature_entry* feature_alloc(uint8_t id) {
+    feature_entry* slot = feature_find(id);
+    if (slot) return slot;
+    // Find an unused slot first.
+    for (uint8_t i = 0; i < FEATURE_CACHE_SLOTS; i++) {
+        if (feature_table[i].id == 0) return &feature_table[i];
+    }
+    // Otherwise rotate-evict.
+    slot = &feature_table[feature_next_evict];
+    feature_next_evict = (feature_next_evict + 1) % FEATURE_CACHE_SLOTS;
+    return slot;
+}
+
+static void feature_clear_all(void) {
+    for (uint8_t i = 0; i < FEATURE_CACHE_SLOTS; i++) {
+        feature_table[i].id = 0;
+        feature_table[i].len = 0;
+    }
+    feature_next_evict = 0;
+}
+
+// Static slab pool for outbound L2CAP packets. Replaces std::queue<std::vector<uint8_t>>.
+// 100 Hz audio path was malloc/free per frame; this keeps everything in BSS.
+// Slot size 400 covers: 0x36 audio report (398 + A2 header = 399), 0x32 init (143),
+// 0x31 forward output (79). Pool depth 8 absorbs short BT congestion bursts.
+#define TX_SLOT_SIZE 400
+#define TX_POOL_DEPTH 8
+struct tx_slot {
+    uint8_t  data[TX_SLOT_SIZE];
+    uint16_t len;
+};
+// In scratch_x SRAM bank: hot path on every audio packet (~100 Hz),
+// avoids striped-SRAM contention with core 1.
+static tx_slot __scratch_x("bt_tx_pool") tx_pool[TX_POOL_DEPTH];
+static uint8_t tx_head = 0;
+static uint8_t tx_tail = 0;
+static uint8_t tx_count = 0;
+volatile uint32_t bt_tx_drops = 0;
+volatile uint32_t bt_tx_oversize = 0;
+volatile uint32_t bt_l2cap_errs = 0;
+
 static critical_section_t queue_lock;
 uint32_t inactive_time = 0; // 手柄长时间静默
 
@@ -196,6 +253,9 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 acl_handle = handle;
                 hci_event_connection_complete_get_bd_addr(packet, current_device_addr);
                 printf("[HCI] ACL connected handle=0x%04X\n", handle);
+                // Probe the remote name so we can pick the right controller profile
+                // before USB enumerates. Reply arrives as HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE.
+                gap_remote_name_request(current_device_addr, 0, 0);
                 printf("[HCI] Request authentication on handle=0x%04X\n", handle);
                 hci_send_cmd(&hci_authentication_requested, handle);
             } else {
@@ -203,6 +263,22 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 new_pair = false;
                 printf("[HCI] ACL connect failed status=0x%02X, restart inquiry\n", status);
                 // gap_inquiry_start(30);
+            }
+            break;
+        }
+
+        case HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE: {
+            const uint8_t status = hci_event_remote_name_request_complete_get_status(packet);
+            if (status == 0) {
+                const char *name = hci_event_remote_name_request_complete_get_remote_name(packet);
+                const controller_profile_t *p = strstr(name, "Edge") ? &profile_dse : &profile_ds;
+                controller_profile_set(p);
+                printf("[BT] Remote name '%s' -> profile: %s\n", name, p->product_string);
+                persist_save_if_changed(current_device_addr, p->profile_idx);
+            } else {
+                // Fall back to the default (DS) and warn. Edge users will see truncated
+                // back-paddle bytes until they reconnect, but core functionality works.
+                printf("[BT] Remote name request failed status=0x%02X, defaulting to DS\n", status);
             }
             break;
         }
@@ -302,7 +378,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             acl_handle = HCI_CON_HANDLE_INVALID;
             hid_control_cid = 0;
             hid_interrupt_cid = 0;
-            feature_data.clear();
+            feature_clear_all();
             cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
             printf("[HCI] Disconnected reason=0x%02X, start inquiry\n", reason);
             gap_inquiry_start(30);
@@ -332,13 +408,21 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                 bt_disconnect();
             }
         } else if (channel == hid_control_cid) {
-            if (packet[0] == 0xA3) {
+            if (packet[0] == 0xA3 && size >= 2) {
                 uint8_t report_id = packet[1];
-                feature_data[report_id].assign(packet + 1, packet + size);
-                printf("[L2CAP] Stored Feature Report 0x%02X, len=%u\n", report_id, size - 1);
+                // Payload is everything after the 0xA3 header and the report id.
+                uint16_t payload_len = (size > 2) ? (size - 2) : 0;
+                if (payload_len > FEATURE_PAYLOAD_MAX) payload_len = FEATURE_PAYLOAD_MAX;
+                feature_entry* slot = feature_alloc(report_id);
+                slot->id = report_id;
+                slot->len = (uint8_t)payload_len;
+                if (payload_len > 0) memcpy(slot->payload, packet + 2, payload_len);
+                printf("[L2CAP] Stored Feature Report 0x%02X, len=%u\n", report_id, payload_len);
             }
+#ifdef DEBUG_BT
             printf("[L2CAP] HID Control data len=%u\n", size);
             printf_hexdump(packet, size);
+#endif
             bt_data_callback(CONTROL, packet, size);
         } else {
             printf("[L2CAP] Data on unknown channel 0x%04X (Interrupt: 0x%04X, Control: 0x%04X)\n",
@@ -436,80 +520,111 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             break;
         }
 
-        case L2CAP_EVENT_CAN_SEND_NOW: {
-            // printf("[L2CAP] L2CAP_EVENT_CAN_SEND_NOW\n");
-
-            critical_section_enter_blocking(&queue_lock);
-            if (send_queue.empty()) {
-                critical_section_exit(&queue_lock);
-                break;
-            }
-            vector<uint8_t> data = send_queue.front();
-            send_queue.pop();
-            critical_section_exit(&queue_lock);
-
-            uint8_t status = l2cap_send(hid_interrupt_cid, data.data(), data.size());
-            if (status != 0) {
-                printf("[L2CAP] Interrupt Error, Status: 0x%02X\n", status);
-            }
-            l2cap_request_can_send_now_event(hid_interrupt_cid);
+        case L2CAP_EVENT_CAN_SEND_NOW:
+            l2cap_can_send_now_drain();
             break;
-        }
     }
 }
 
-void bt_write(uint8_t *data, uint16_t len) {
-    if (hid_interrupt_cid == 0) return;
-    vector<uint8_t> packet(len + 1);
-    packet[0] = 0xA2;
-    memcpy(packet.data() + 1, data, len);
-    fill_output_report_checksum(packet.data() + 1, len);
-
+static void __not_in_flash_func(l2cap_can_send_now_drain)(void) {
     critical_section_enter_blocking(&queue_lock);
-    send_queue.push(move(packet)); // 使用 move 避免深拷贝
-    critical_section_exit(&queue_lock);
-
-    if (hid_interrupt_cid == 0) {
-        printf("[L2CAP bt_write] Warning: hid_interrupt_cid 0");
+    if (tx_count == 0) {
+        critical_section_exit(&queue_lock);
         return;
     }
-    if (send_queue.size() == 1) {
+    // Snapshot the head slot under lock, send outside lock.
+    uint8_t  local[TX_SLOT_SIZE];
+    uint16_t local_len = tx_pool[tx_head].len;
+    memcpy(local, tx_pool[tx_head].data, local_len);
+    tx_head = (tx_head + 1) % TX_POOL_DEPTH;
+    tx_count--;
+    uint8_t remaining = tx_count;
+    critical_section_exit(&queue_lock);
+
+    uint8_t status = l2cap_send(hid_interrupt_cid, local, local_len);
+    if (status != 0) {
+        __atomic_fetch_add(&bt_l2cap_errs, 1, __ATOMIC_RELAXED);
+    }
+    if (remaining > 0) {
+        // More packets queued -> re-arm to drain the next one.
         l2cap_request_can_send_now_event(hid_interrupt_cid);
     }
 }
 
-vector<uint8_t> get_feature_data(uint8_t reportId, uint16_t len) {
-    // 若为0x81则会请求新内容，其他若有旧数据则不进行请求
-    auto ret = vector<uint8_t>{};
-    if (feature_data.contains(reportId)) {
-        ret = feature_data[reportId];
+void __not_in_flash_func(bt_write)(uint8_t *data, uint16_t len) {
+    if (hid_interrupt_cid == 0) return;
+    if (len + 1 > TX_SLOT_SIZE) {
+        __atomic_fetch_add(&bt_tx_oversize, 1, __ATOMIC_RELAXED);
+        return;
     }
-    if (!feature_data.contains(reportId) || reportId == 0x81) {
+
+    critical_section_enter_blocking(&queue_lock);
+    if (tx_count == TX_POOL_DEPTH) {
+        // Drop oldest to keep the audio path moving under congestion.
+        tx_head = (tx_head + 1) % TX_POOL_DEPTH;
+        tx_count--;
+        __atomic_fetch_add(&bt_tx_drops, 1, __ATOMIC_RELAXED);
+    }
+    tx_slot* slot = &tx_pool[tx_tail];
+    slot->data[0] = 0xA2;
+    memcpy(slot->data + 1, data, len);
+    fill_output_report_checksum(slot->data + 1, len);
+    slot->len = len + 1;
+    tx_tail = (tx_tail + 1) % TX_POOL_DEPTH;
+    tx_count++;
+    bool was_only = (tx_count == 1);
+    critical_section_exit(&queue_lock);
+
+    if (was_only) {
+        l2cap_request_can_send_now_event(hid_interrupt_cid);
+    }
+}
+
+uint16_t get_feature_data(uint8_t reportId, uint16_t reqlen, uint8_t* out, uint16_t out_max) {
+    // Look up cache; report 0x81 always re-queries (matches prior behavior).
+    feature_entry* slot = feature_find(reportId);
+    uint16_t copied = 0;
+    if (slot && out && out_max > 0) {
+        copied = slot->len < out_max ? slot->len : out_max;
+        memcpy(out, slot->payload, copied);
+    }
+    if (!slot || reportId == 0x81) {
         if (hid_control_cid != 0) {
             uint8_t get_feature[] = {0x43, reportId};
-            l2cap_send(hid_control_cid, get_feature, len);
+            l2cap_send(hid_control_cid, get_feature, reqlen);
             printf("[L2CAP] Requesting Get Feature Report 0x%02X\n", reportId);
         }
     }
-    return ret;
+    return copied;
 }
 
 void set_feature_data(uint8_t reportId, uint8_t* data,uint16_t len) {
-    if (hid_control_cid != 0) {
-        uint8_t get_feature[len + 2];
-        get_feature[0] = 0x53;
-        get_feature[1] = reportId;
-        memcpy(get_feature + 2,data,len);
-        fill_feature_report_checksum(get_feature + 1,len + 1);
-        l2cap_send(hid_control_cid, get_feature, len + 2);
-        printf("[L2CAP] Requesting Set Feature Report 0x%02X\n", reportId);
-        printf_hexdump(get_feature,len + 2);
+    if (hid_control_cid == 0) return;
+    // Largest known DualSense / Edge feature report is 64 bytes; this stack
+    // buffer covers any of them (header + report id + payload).
+    static const uint16_t SET_FEATURE_MAX = 256;
+    if (len + 2 > SET_FEATURE_MAX) {
+        printf("[L2CAP] set_feature_data: len %u too large\n", len);
+        return;
     }
+    uint8_t buf[SET_FEATURE_MAX];
+    buf[0] = 0x53;
+    buf[1] = reportId;
+    memcpy(buf + 2, data, len);
+    fill_feature_report_checksum(buf + 1, len + 1);
+    l2cap_send(hid_control_cid, buf, len + 2);
+    printf("[L2CAP] Requesting Set Feature Report 0x%02X\n", reportId);
 }
 
 void init_feature() {
-    get_feature_data(0x09, 20);
-    get_feature_data(0x20, 64);
-    get_feature_data(0x22, 64);
-    get_feature_data(0x05, 41);
+    // Fire-and-forget: cache will populate from the async control replies.
+    get_feature_data(0x09, 20, nullptr, 0);
+    get_feature_data(0x20, 64, nullptr, 0);
+    get_feature_data(0x22, 64, nullptr, 0);
+    get_feature_data(0x05, 41, nullptr, 0);
+    if (g_profile == &profile_dse) {
+        // Edge profile-select feature report. Pre-fetching cuts the first-poll
+        // latency the host sees when probing Edge-only IDs.
+        get_feature_data(0x60, 64, nullptr, 0);
+    }
 }

@@ -44,6 +44,7 @@ add_executable(ds5-bridge
         src/usb.cpp
         src/audio.cpp
         src/bt.cpp
+        src/persist.cpp
 )
 
 # Cockos WDLResampler
@@ -58,8 +59,19 @@ target_include_directories(wdl_resampler PUBLIC
 #set(OPUS_FIXED_POINT ON)
 add_subdirectory(lib/opus)
 
-target_compile_options(wdl_resampler PRIVATE -fsigned-char)
-target_compile_options(ds5-bridge PRIVATE -fsigned-char)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+target_compile_options(wdl_resampler PRIVATE
+        -fsigned-char
+        -O3
+        -ffast-math
+        -fno-math-errno
+        -funroll-loops
+)
+target_compile_options(ds5-bridge PRIVATE -fsigned-char -O3 -flto)
+target_link_options(ds5-bridge PRIVATE -flto)
 target_compile_definitions(wdl_resampler PRIVATE
         WDL_RESAMPLE_TYPE=float
 )
@@ -69,12 +81,6 @@ target_compile_definitions(ds5-bridge PRIVATE
         WDL_RESAMPLE_TYPE=float
         CYW43_PIO_CLOCK_DIV_INT=4
 )
-option(ENABLE_DSE "Enable DSE" OFF)
-if(ENABLE_DSE)
-    target_compile_definitions(ds5-bridge PRIVATE
-            ENABLE_DSE # 将PID和产品名称设置为DSE
-    )
-endif()
 
 pico_set_program_name(ds5-bridge "ds5-bridge")
 pico_set_program_version(ds5-bridge "0.5.3")
@@ -98,6 +104,8 @@ target_link_libraries(ds5-bridge
         pico_multicore
         hardware_watchdog
         hardware_timer
+        hardware_flash
+        pico_flash
         pico_btstack_classic
 #        pico_cyw43_arch_threadsafe_background
         pico_cyw43_arch_poll

@@ -8,6 +8,8 @@
 #include "utils.h"
 #include "resample.h"
 #include "audio.h"
+#include "controller_profile.h"
+#include "persist.h"
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"
 #include "hardware/watchdog.h"
@@ -19,7 +21,11 @@
 int reportSeqCounter = 0;
 uint8_t packetCounter = 0;
 
-uint8_t interrupt_in_data[63] = {
+// Sized to fit Edge's longer input report; standard DualSense fits in the first 63 bytes.
+// Initialized with a benign DualSense-shaped report so a host that polls before BT
+// connects sees neutral inputs instead of zeroed-out (which presents as triggers held).
+#define MAX_INPUT_REPORT 78
+uint8_t interrupt_in_data[MAX_INPUT_REPORT] = {
     0x7f, 0x7d, 0x7f, 0x7e, 0x00, 0x00, 0xa7,
     0x08, 0x00, 0x00, 0x00, 0x52, 0x43, 0x30, 0x41,
     0x01, 0x00, 0x0e, 0x00, 0xef, 0xff, 0x03, 0x03,
@@ -37,13 +43,12 @@ void interrupt_loop() {
     if (!tud_hid_ready()) return;
 
     bool should_send = false;
-    // Local buffer to hold the report data while we prepare it to send. 
-    uint8_t safe_report[63];
-
+    uint8_t safe_report[MAX_INPUT_REPORT];
+    uint16_t report_len = g_profile->input_report_size;
 
     critical_section_enter_blocking(&report_cs);
     if (report_dirty) {
-        memcpy(safe_report, interrupt_in_data, 63);
+        memcpy(safe_report, interrupt_in_data, report_len);
         report_dirty = false;
         should_send = true;
     }
@@ -51,10 +56,10 @@ void interrupt_loop() {
 
     // Only send to TinyUSB if we actually grabbed fresh data
     if (should_send) {
-        if (!tud_hid_report(0x01, safe_report, 63)) {
+        if (!tud_hid_report(0x01, safe_report, report_len)) {
             printf("[USBHID] tud_hid_report error\n");
-            
-            // If the report failed to queue, restore the dirty flag 
+
+            // If the report failed to queue, restore the dirty flag
             // so we try again on the next loop iteration.
             critical_section_enter_blocking(&report_cs);
             report_dirty = true;
@@ -66,18 +71,21 @@ void interrupt_loop() {
 void on_bt_data(CHANNEL_TYPE channel, uint8_t *data, uint16_t len) {
     // printf("[Main] BT data callback: channel=%u len=%u\n", channel, len);
     if (channel == INTERRUPT && data[1] == 0x31) {
+        // Headset bit lives at the same fixed offset in the BT-framed buffer for
+        // both DS and Edge — header is 3 bytes, then bytes 53/56 of the report.
         if ((data[56] & 1) != (interrupt_in_data[53] & 1)) {
             set_headset(data[56] & 1);
         }
 
-        // We add the critical section here to avoid any race conditions when writing to the interrupt_in_data buffer,
-        // which is shared between the main loop and this callback. 
-        // The critical section ensures that only one thread can access the buffer at a time, 
-        // preventing data corruption and ensuring thread safety.   
-        // We also set the report_dirty flag to true to indicate that new data is available
-        //  and needs to be sent in the next interrupt report.
+        // Forward the controller-typed report length, but never more than what
+        // the BT packet actually carries.
+        uint16_t want = g_profile->input_report_size;
+        uint16_t avail = (len > 3) ? (uint16_t)(len - 3) : 0;
+        uint16_t copy = want < avail ? want : avail;
+        if (copy > MAX_INPUT_REPORT) copy = MAX_INPUT_REPORT;
+
         critical_section_enter_blocking(&report_cs);
-        memcpy(interrupt_in_data, data + 3, 63);
+        memcpy(interrupt_in_data, data + 3, copy);
         report_dirty = true;
         critical_section_exit(&report_cs);
     }
@@ -89,17 +97,8 @@ void on_bt_data(CHANNEL_TYPE channel, uint8_t *data, uint16_t len) {
 uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer,
                                uint16_t reqlen) {
     (void) itf;
-    (void) report_id;
     (void) report_type;
-    (void) buffer;
-    (void) reqlen;
-
-    std::vector<uint8_t> feature_data = get_feature_data(report_id, reqlen);
-    if (!feature_data.empty()) {
-        memcpy(buffer, feature_data.data() + 1, feature_data.size() - 1);
-    }
-
-    return feature_data.empty() ? 0 : feature_data.size() - 1;
+    return get_feature_data(report_id, reqlen, buffer, reqlen);
 }
 
 // Invoked when received SET_REPORT control request or
@@ -173,6 +172,10 @@ int main() {
     // Initialize the critical section for the report buffer
     critical_section_init(&report_cs);
 
+    // Load the persisted controller profile so USB descriptors enumerate as the
+    // last-paired controller before the BT side reconnects.
+    persist_load();
+
     bt_init();
     bt_register_data_callback(on_bt_data);
 
@@ -180,11 +183,32 @@ int main() {
 
     watchdog_enable(1000, true);
 
+    absolute_time_t next_stats = make_timeout_time_ms(5000);
     while (1) {
         watchdog_update();
         cyw43_arch_poll();
         tud_task();
         audio_loop();
         interrupt_loop();
+
+        if (absolute_time_diff_us(get_absolute_time(), next_stats) <= 0) {
+            uint32_t a = audio_fifo_drops, o = opus_fifo_drops, m = opus_dequeue_misses;
+            uint32_t tx_d = bt_tx_drops, tx_o = bt_tx_oversize, l2 = bt_l2cap_errs;
+            uint32_t hw = audio_get_core1_stack_high_water_bytes();
+            if (a | o | m | tx_d | tx_o | l2) {
+                printf("[Stats] audio_drops=%lu opus_drops=%lu opus_miss=%lu "
+                       "bt_tx_drops=%lu bt_tx_oversize=%lu l2cap_errs=%lu c1_stack=%lu\n",
+                       (unsigned long)a, (unsigned long)o, (unsigned long)m,
+                       (unsigned long)tx_d, (unsigned long)tx_o, (unsigned long)l2,
+                       (unsigned long)hw);
+                audio_fifo_drops = 0;
+                opus_fifo_drops = 0;
+                opus_dequeue_misses = 0;
+                bt_tx_drops = 0;
+                bt_tx_oversize = 0;
+                bt_l2cap_errs = 0;
+            }
+            next_stats = make_timeout_time_ms(5000);
+        }
     }
 }

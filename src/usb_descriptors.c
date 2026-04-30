@@ -25,11 +25,49 @@
 
 #include "bsp/board_api.h"
 #include "tusb.h"
+#include "controller_profile.h"
+
+// Forward declarations of the descriptor blobs defined later in this file.
+extern uint8_t const desc_hid_report_ds[];
+extern uint8_t const desc_hid_report_dse[];
+
+//--------------------------------------------------------------------+
+// Controller profile table — runtime selectable.
+//--------------------------------------------------------------------+
+const controller_profile_t profile_ds = {
+    .pid                = 0x0CE6,
+    .hid_descriptor     = desc_hid_report_ds,
+    .hid_descriptor_len = 289,
+    .product_string     = "DualSense Wireless Controller",
+    .input_report_size  = 63,   // BT 0x31 payload minus 3-byte BT header (current behavior)
+    .output_report_size = 78,
+    .profile_idx        = 0,
+};
+
+const controller_profile_t profile_dse = {
+    .pid                = 0x0DF2,
+    .hid_descriptor     = desc_hid_report_dse,
+    .hid_descriptor_len = 405,
+    .product_string     = "DualSense Edge Wireless Controller",
+    .input_report_size  = 75,   // Edge input report 0x01: 64 byte standard + 11 Edge-specific. Verify on hardware.
+    .output_report_size = 78,
+    .profile_idx        = 1,
+};
+
+const controller_profile_t* g_profile = &profile_ds;
+
+void controller_profile_set(const controller_profile_t* p) {
+    if (p) g_profile = p;
+}
+
+const controller_profile_t* controller_profile_for_idx(uint8_t idx) {
+    return idx == 1 ? &profile_dse : &profile_ds;
+}
 
 //--------------------------------------------------------------------+
 // Device Descriptors
 //--------------------------------------------------------------------+
-static tusb_desc_device_t const desc_device =
+static tusb_desc_device_t desc_device =
 {
     .bLength = sizeof(tusb_desc_device_t),
     .bDescriptorType = TUSB_DESC_DEVICE,
@@ -46,11 +84,7 @@ static tusb_desc_device_t const desc_device =
     .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
 
     .idVendor = 0x054C,
-#ifdef ENABLE_DSE
-    .idProduct = 0x0DF2,
-#else
-    .idProduct = 0x0CE6,
-#endif
+    .idProduct = 0x0CE6,    // patched at runtime from g_profile->pid
     .bcdDevice = 0x0100,
 
     .iManufacturer = 0x01,
@@ -63,13 +97,19 @@ static tusb_desc_device_t const desc_device =
 // Invoked when received GET DEVICE DESCRIPTOR
 // Application return pointer to descriptor
 uint8_t const *tud_descriptor_device_cb(void) {
+    desc_device.idProduct = g_profile->pid;
     return (uint8_t const *) &desc_device;
 }
 
 //--------------------------------------------------------------------+
 // Configuration Descriptor
 //--------------------------------------------------------------------+
-uint8_t const descriptor_configuration[] = {
+// Non-const so we can patch the HID report-descriptor length at runtime
+// (offsets HID_DESC_LEN_LO/HID_DESC_LEN_HI below) based on g_profile.
+// Costs ~233 B of RAM vs flash-only; trivial on RP2350.
+#define HID_DESC_LEN_LO_OFFSET 211
+#define HID_DESC_LEN_HI_OFFSET 212
+static uint8_t descriptor_configuration[] = {
     // --- CONFIGURATION DESCRIPTOR ---
     0x09, // bLength
     0x02, // bDescriptorType (CONFIGURATION)
@@ -302,11 +342,7 @@ uint8_t const descriptor_configuration[] = {
     0x00, // bCountryCode: Not localized
     0x01, // bNumDescriptors: 1 report descriptor
     0x22, // bDescriptorType: Report
-#ifdef ENABLE_DSE
-    0x95, 0x01, // wDescriptorLength: 405 (0x0121)
-#else
-    0x21, 0x01, // wDescriptorLength: 289 (0x0121)
-#endif
+    0x21, 0x01, // wDescriptorLength: patched at runtime to 289 (DS) or 405 (DSE)
 
     // Endpoint Descriptor (HID IN: EP4)
     0x07, // bLength
@@ -330,6 +366,8 @@ uint8_t const descriptor_configuration[] = {
 // Descriptor contents must exist long enough for transfer to complete
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
     (void) index; // for multiple configurations
+    descriptor_configuration[HID_DESC_LEN_LO_OFFSET] = g_profile->hid_descriptor_len & 0xFF;
+    descriptor_configuration[HID_DESC_LEN_HI_OFFSET] = (g_profile->hid_descriptor_len >> 8) & 0xFF;
     return descriptor_configuration;
 }
 
@@ -337,7 +375,6 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
 // HID Report Descriptor
 //--------------------------------------------------------------------+
 
-#ifndef ENABLE_DSE
 uint8_t const desc_hid_report_ds[] = {
     0x05, 0x01, // Usage Page (Generic Desktop Ctrls)
     0x09, 0x05, // Usage (Game Pad)
@@ -483,9 +520,7 @@ uint8_t const desc_hid_report_ds[] = {
     0xC0, // End Collection
     // 289 bytes
 };
-#endif
 
-#ifdef ENABLE_DSE
 uint8_t const desc_hid_report_dse[] = {
     0x05, 0x01, // Usage Page (Generic Desktop Ctrls)
     0x09, 0x05, // Usage (Game Pad)
@@ -689,18 +724,13 @@ uint8_t const desc_hid_report_dse[] = {
     0xC0, // End Collection
     // 405 bytes
 };
-#endif
 
 // Invoked when received GET HID REPORT DESCRIPTOR
 // Application return pointer to descriptor
 // Descriptor contents must exist long enough for transfer to complete
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t itf) {
     (void) itf;
-#ifdef ENABLE_DSE
-    return desc_hid_report_dse;
-#else
-    return desc_hid_report_ds;
-#endif
+    return g_profile->hid_descriptor;
 }
 
 //--------------------------------------------------------------------+
@@ -720,12 +750,8 @@ static char const *string_desc_arr[] =
 {
     (const char[]){0x09, 0x04}, // 0: is supported language is English (0x0409)
     "Sony Interactive Entertainment", // 1: Manufacturer
-#ifdef ENABLE_DSE
-    "DualSense Edge Wireless Controller",
-#else
-    "DualSense Wireless Controller", // 2: Product
-#endif
-    NULL, // 3: Serials will use unique ID if possible
+    NULL, // 2: Product — patched at runtime to g_profile->product_string
+    NULL, // 3: Serial   — generated from board_usb_get_serial + profile suffix
 };
 
 static uint16_t _desc_str[60 + 1];
@@ -742,9 +768,28 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
             chr_count = 1;
             break;
 
-        case STRID_SERIAL:
+        case STRID_SERIAL: {
             chr_count = board_usb_get_serial(_desc_str + 1, 32);
+            // Append a profile-distinct suffix so Windows doesn't cache the wrong
+            // driver across a profile swap on the same chip. 'D' for DualSense,
+            // 'E' for Edge.
+            if (chr_count + 1 < sizeof(_desc_str) / sizeof(_desc_str[0])) {
+                _desc_str[1 + chr_count] = (g_profile->profile_idx == 1) ? 'E' : 'D';
+                chr_count++;
+            }
             break;
+        }
+
+        case STRID_PRODUCT: {
+            const char *str = g_profile->product_string;
+            chr_count = strlen(str);
+            size_t const max_count = sizeof(_desc_str) / sizeof(_desc_str[0]) - 1;
+            if (chr_count > max_count) chr_count = max_count;
+            for (size_t i = 0; i < chr_count; i++) {
+                _desc_str[1 + i] = str[i];
+            }
+            break;
+        }
 
         default:
             // Note: the 0xEE index string is a Microsoft OS 1.0 Descriptors.
@@ -753,6 +798,7 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
             if (!(index < sizeof(string_desc_arr) / sizeof(string_desc_arr[0]))) return NULL;
 
             const char *str = string_desc_arr[index];
+            if (!str) return NULL;
 
             // Cap at max char
             chr_count = strlen(str);

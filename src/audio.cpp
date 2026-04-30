@@ -30,7 +30,9 @@ static WDL_Resampler resampler;
 static uint8_t reportSeqCounter = 0;
 static uint8_t packetCounter = 0;
 static bool plug_headset = false;
-alignas(8) static uint32_t audio_core1_stack[8192];
+#define CORE1_STACK_WORDS 8192
+#define CORE1_STACK_CANARY 0xDEADBEEFu
+alignas(8) static uint32_t audio_core1_stack[CORE1_STACK_WORDS];
 queue_t audio_fifo;
 queue_t opus_fifo;
 struct audio_raw_element {
@@ -40,21 +42,26 @@ struct opus_element {
     uint8_t data[200];
 };
 
+volatile uint32_t audio_fifo_drops = 0;
+volatile uint32_t opus_fifo_drops = 0;
+volatile uint32_t opus_dequeue_misses = 0;
+
 void set_headset(bool state) {
     plug_headset = state;
 }
 
-// 有一个重构的想法，就是也把haptics也放进队列里面，使用定时器来发送数据
-// 定时器伪代码:
-// static uint8_t haptics_buf[64];
-// static uint8_t speaker_buf[200];
-// static auto last = time_us32();
-// auto now = time_us32();
-// if(now - last < 10666) return;
-// func: send haptics and speaker;
-// try_queue_remove - haptics and speaker
-// 缺点是可能会导致haptics有延迟，不够实时？
-void audio_loop() {
+uint32_t audio_get_core1_stack_high_water_bytes() {
+    // Walk from the bottom of the stack until the first non-canary word; the
+    // distance from there to the top is the peak depth ever reached.
+    for (uint32_t i = 0; i < CORE1_STACK_WORDS; i++) {
+        if (audio_core1_stack[i] != CORE1_STACK_CANARY) {
+            return (CORE1_STACK_WORDS - i) * sizeof(uint32_t);
+        }
+    }
+    return 0;
+}
+
+void __not_in_flash_func(audio_loop)() {
     // 1. 读取 USB 音频数据
     if (!tud_audio_available()) return;
 
@@ -65,7 +72,9 @@ void audio_loop() {
         return;
     }
 
-    static float audio_buf[512 * 2];
+    // 4 KB hot buffer — placed in scratch_y SRAM bank to avoid striped-SRAM
+    // contention with core 1's Opus encoder.
+    static float __scratch_y("audio_buf") audio_buf[512 * 2];
     static uint audio_buf_pos = 0;
     // 2. 从4ch中提取ch3/ch4，转换为float输入重采样器
     WDL_ResampleSample *in_buf;
@@ -79,9 +88,10 @@ void audio_loop() {
             memcpy(element.data,audio_buf,512 * 2 * 4);
             if (queue_is_full(&audio_fifo)){
                 queue_try_remove(&audio_fifo,NULL);
+                __atomic_fetch_add(&audio_fifo_drops, 1, __ATOMIC_RELAXED);
             }
             if (!queue_try_add(&audio_fifo,&element)) {
-                printf("[Audio] Warning: audio_fifo add failed\n");
+                __atomic_fetch_add(&audio_fifo_drops, 1, __ATOMIC_RELAXED);
             }
             audio_buf_pos = 0;
         }
@@ -91,10 +101,10 @@ void audio_loop() {
     }
 
     // 3. 48kHz -> 3kHz 重采样
-    static WDL_ResampleSample out_buf[SAMPLE_SIZE]; // 64 floats = 32帧 × 2ch
+    static __scratch_x("audio_hot") WDL_ResampleSample out_buf[SAMPLE_SIZE]; // 64 floats = 32帧 × 2ch
     int out_frames = resampler.ResampleOut(out_buf, nframes, SAMPLE_SIZE / OUTPUT_CHANNELS, OUTPUT_CHANNELS);
 
-    static int8_t haptic_buf[SAMPLE_SIZE];
+    static __scratch_x("audio_hot") int8_t haptic_buf[SAMPLE_SIZE];
     static int haptic_buf_pos = 0;
 
     // 4. 转换为int8并缓冲，满64字节即组包发送
@@ -132,7 +142,7 @@ void audio_loop() {
             pkt[78] = 200;
             memcpy(pkt + 79,opus_packet.data,200);
         }else {
-            printf("[Audio] Warning: opus_fifo try remove failed\n");
+            __atomic_fetch_add(&opus_dequeue_misses, 1, __ATOMIC_RELAXED);
         }
 
         bt_write(pkt, sizeof(pkt));
@@ -145,15 +155,45 @@ void audio_init() {
     resampler.SetRates(48000, 3000);
     resampler.SetFeedMode(true);
     // resampler.Prealloc(2, 480, 32);
-    queue_init(&audio_fifo,sizeof(audio_raw_element),2);
-    queue_init(&opus_fifo,sizeof(opus_element),2);
+    queue_init(&audio_fifo,sizeof(audio_raw_element),4);
+    queue_init(&opus_fifo,sizeof(opus_element),3);
     multicore_launch_core1_with_stack(core1_entry,audio_core1_stack,sizeof(audio_core1_stack));
 }
 
 static OpusEncoder *encoder;
 static WDL_Resampler resampler_audio;
 
+static void __not_in_flash_func(audio_core1_step)() {
+    static audio_raw_element audio_element{};
+    queue_remove_blocking(&audio_fifo,&audio_element);
+    // 将 512 frames 重采样成 480 frames 以解决噪音问题。感谢 @Junhoo
+    WDL_ResampleSample *in_buf;
+    int nframes = resampler_audio.ResamplePrepare(512, 2, &in_buf);
+    for (int i = 0; i < nframes * 2;i++) {
+        in_buf[i] = audio_element.data[i];
+    }
+    static WDL_ResampleSample out_buf[480 * 2];
+    resampler_audio.ResampleOut(out_buf,nframes,480,2);
+    static opus_element opus_packet{};
+    int32_t enc_n = opus_encode_float(encoder,out_buf,480,opus_packet.data,200);
+    (void)enc_n;
+    if (queue_is_full(&opus_fifo)) {
+        queue_try_remove(&opus_fifo,NULL);
+        __atomic_fetch_add(&opus_fifo_drops, 1, __ATOMIC_RELAXED);
+    }
+    if (!queue_try_add(&opus_fifo,&opus_packet)) {
+        __atomic_fetch_add(&opus_fifo_drops, 1, __ATOMIC_RELAXED);
+    }
+}
+
 void core1_entry() {
+    // Paint the stack with a canary so audio_get_core1_stack_high_water() can
+    // walk from the bottom and find the deepest point ever reached. Skip the
+    // top 64 words (256 B) to avoid stomping the SDK's setup frame.
+    for (uint32_t i = 0; i + 64 < CORE1_STACK_WORDS; i++) {
+        audio_core1_stack[i] = CORE1_STACK_CANARY;
+    }
+
     int error = 0;
     encoder = opus_encoder_create(48000,2,OPUS_APPLICATION_AUDIO,&error);
     if (error != 0) {
@@ -169,23 +209,6 @@ void core1_entry() {
     resampler_audio.SetFeedMode(true);
 
     while (true) {
-        static audio_raw_element audio_element{};
-        queue_remove_blocking(&audio_fifo,&audio_element);
-        // 将 512 frames 重采样成 480 frames 以解决噪音问题。感谢 @Junhoo
-        WDL_ResampleSample *in_buf;
-        int nframes = resampler_audio.ResamplePrepare(512, 2, &in_buf);
-        for (int i = 0; i < nframes * 2;i++) {
-            in_buf[i] = audio_element.data[i];
-        }
-        static WDL_ResampleSample out_buf[480 * 2];
-        resampler_audio.ResampleOut(out_buf,nframes,480,2);
-        static opus_element opus_packet{};
-        (void)opus_encode_float(encoder,out_buf,480,opus_packet.data,200);
-        if (queue_is_full(&opus_fifo)) {
-            queue_try_remove(&opus_fifo,NULL);
-        }
-        if (!queue_try_add(&opus_fifo,&opus_packet)) {
-            printf("[Audio] Warning: opus_fifo add failed\n");
-        }
+        audio_core1_step();
     }
 }
