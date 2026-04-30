@@ -13,6 +13,9 @@
 #include "hardware/watchdog.h"
 #include "pico/cyw43_arch.h"
 
+// Pico SDK speciifically for waiting on conditions
+#include "pico/critical_section.h"
+
 int reportSeqCounter = 0;
 uint8_t packetCounter = 0;
 
@@ -27,10 +30,36 @@ uint8_t interrupt_in_data[63] = {
     0x53, 0x9f, 0x28, 0x35, 0xa5, 0xa8, 0x0c, 0x8b
 };
 
+critical_section_t report_cs;
+volatile bool report_dirty = false;
+
 void interrupt_loop() {
     if (!tud_hid_ready()) return;
-    if (!tud_hid_report(0x01, interrupt_in_data, 63)) {
-        printf("[USBHID] tud_hid_report error\n");
+
+    bool should_send = false;
+    // Local buffer to hold the report data while we prepare it to send. 
+    uint8_t safe_report[63];
+
+
+    critical_section_enter_blocking(&report_cs);
+    if (report_dirty) {
+        memcpy(safe_report, interrupt_in_data, 63);
+        report_dirty = false;
+        should_send = true;
+    }
+    critical_section_exit(&report_cs);
+
+    // Only send to TinyUSB if we actually grabbed fresh data
+    if (should_send) {
+        if (!tud_hid_report(0x01, safe_report, 63)) {
+            printf("[USBHID] tud_hid_report error\n");
+            
+            // If the report failed to queue, restore the dirty flag 
+            // so we try again on the next loop iteration.
+            critical_section_enter_blocking(&report_cs);
+            report_dirty = true;
+            critical_section_exit(&report_cs);
+        }
     }
 }
 
@@ -40,7 +69,17 @@ void on_bt_data(CHANNEL_TYPE channel, uint8_t *data, uint16_t len) {
         if ((data[56] & 1) != (interrupt_in_data[53] & 1)) {
             set_headset(data[56] & 1);
         }
+
+        // We add the critical section here to avoid any race conditions when writing to the interrupt_in_data buffer,
+        // which is shared between the main loop and this callback. 
+        // The critical section ensures that only one thread can access the buffer at a time, 
+        // preventing data corruption and ensuring thread safety.   
+        // We also set the report_dirty flag to true to indicate that new data is available
+        //  and needs to be sent in the next interrupt report.
+        critical_section_enter_blocking(&report_cs);
         memcpy(interrupt_in_data, data + 3, 63);
+        report_dirty = true;
+        critical_section_exit(&report_cs);
     }
 }
 
@@ -130,6 +169,9 @@ int main() {
     } else {
         printf("Clean boot\n");
     }
+  
+    // Initialize the critical section for the report buffer
+    critical_section_init(&report_cs);
 
     bt_init();
     bt_register_data_callback(on_bt_data);
